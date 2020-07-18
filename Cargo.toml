@@ -1,5 +1,6 @@
 [package]
 name = "edelcrantz"
+description = "async peer-to-peer rpc-and-messaging service"
 version = "0.1.0"
 authors = ["Graydon Hoare <graydon@pobox.com>"]
 edition = "2018"
