@@ -1,0 +1,23 @@
+[package]
+name = "edelcrantz"
+version = "0.1.0"
+authors = ["Graydon Hoare <graydon@pobox.com>"]
+edition = "2018"
+license = "MIT OR Apache-2.0"
+keywords = ["rpc", "async", "service", "io"]
+repository = "http://github.com/graydon/edelcrantz"
+readme = "README.md"
+
+[dependencies]
+log = "0.4.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_cbor = "0.11.1"
+byteorder_async = {version="1.2.0", features=["futures_async"] }
+futures = "0.3.5"
+thiserror = "1.0"
+
+[dev-dependencies]
+sluice = "0.5.2"
+duplexify = "1.1.0"
+async-std = "1.6.2"
+pretty_env_logger = "0.4"
