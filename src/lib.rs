@@ -144,7 +144,7 @@ pub struct Connection<OneWay:Msg, Request:Msg, Response:Msg> {
     dequeue: UnboundedReceiver<Envelope<OneWay,Request,Response>>,
 
     /// Futures being fulfilled by requests being served by this peer.
-    responses: FuturesUnordered<BoxFuture<'static, (u64, Response)>>,
+    responses: Mutex<FuturesUnordered<BoxFuture<'static, (u64, Response)>>>,
 }
 
 #[serde(bound = "")]
@@ -169,7 +169,7 @@ Connection<OneWay, Request, Response> {
         let io = IO::new(rw);
         let next_request = 0;
         let requests = HashMap::new();
-        let responses = FuturesUnordered::new();
+        let responses = Mutex::new(FuturesUnordered::new());
         let (enqueue, dequeue) = unbounded();
         Connection { io, next_request, requests, responses, enqueue, dequeue }
     }
@@ -218,6 +218,7 @@ Connection<OneWay, Request, Response> {
           FutureResponse: Future<Output=Response> + Send + 'static,
           ServeOneWay: FnOnce(OneWay)->()
     {
+        let mut resp_guard = self.responses.lock().await;
         select_biased! {
             next_enqueued = self.dequeue.next() => match next_enqueued {
                 None => Ok(()),
@@ -226,7 +227,7 @@ Connection<OneWay, Request, Response> {
                     Ok(self.io.send(env).await?)
                 }
             },
-            next_response = self.responses.next() => match next_response {
+            next_response = resp_guard.next() => match next_response {
                 None => Ok(()),
                 Some((n, response)) => {
                     let env = Envelope::Response(n, response);
@@ -245,7 +246,7 @@ Connection<OneWay, Request, Response> {
                         trace!("received request envelope {}, calling service function", n);
                         let res_fut = srv_req(req);
                         let boxed : BoxFuture<'static,_> = Box::pin(res_fut.map(move |r| (n, r)));
-                        Ok(self.responses.push(boxed))
+                        Ok(resp_guard.push(boxed))
                     },
                     Envelope::Response(n, res) => {
                         trace!("received response envelope {}, transferring to future", n);
