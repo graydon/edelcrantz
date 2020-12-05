@@ -41,8 +41,8 @@ fn one_way() {
     let mut peer_a = Connection::<OneWay, Request, Response>::new(a_end);
     let mut peer_b = Connection::<OneWay, Request, Response>::new(b_end);
 
-    peer_a.enqueue_oneway(OneWay("hello".into())).unwrap();
     block_on(async move {   
+        peer_a.enqueue_oneway(OneWay("hello".into())).await.unwrap();
         loop {
             let mut done = false;
             select! {

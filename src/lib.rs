@@ -50,7 +50,7 @@ use futures::lock::Mutex;
 use futures::{select_biased};
 use futures::channel::mpsc::{unbounded,UnboundedReceiver,UnboundedSender};
 use thiserror::Error;
-use std::collections::{HashMap};
+use std::{sync::Arc, collections::{HashMap}};
 use log::trace;
 
 #[cfg(test)]
@@ -125,10 +125,8 @@ impl IO {
     }
 }
 
-pub struct Connection<OneWay:Msg, Request:Msg, Response:Msg> {
-    /// The IO apparatus.
-    io: IO,
-
+struct Reception<OneWay:Msg, Request:Msg, Response:Msg>
+{
     /// The next request number this peer is going to send.
     next_request: u64,
 
@@ -139,6 +137,13 @@ pub struct Connection<OneWay:Msg, Request:Msg, Response:Msg> {
 
     /// The sending side of a waitable queue for outgoing envelopes. 
     enqueue: UnboundedSender<Envelope<OneWay,Request,Response>>,
+}
+
+pub struct Connection<OneWay:Msg, Request:Msg, Response:Msg> {
+    /// The IO apparatus.
+    io: IO,
+
+    reception: Arc<Mutex<Reception<OneWay,Request,Response>>>,
 
     /// The receiving side of a waitable queue for outgoing envelopes.
     dequeue: UnboundedReceiver<Envelope<OneWay,Request,Response>>,
@@ -171,29 +176,40 @@ Connection<OneWay, Request, Response> {
         let requests = HashMap::new();
         let responses = Mutex::new(FuturesUnordered::new());
         let (enqueue, dequeue) = unbounded();
-        Connection { io, next_request, requests, responses, enqueue, dequeue }
+        let reception = Arc::new(Mutex::new(Reception{next_request, requests, enqueue}));
+        Connection { io, reception, responses, dequeue }
     }
 
     /// Enqueue a OneWay message for sending.
-    pub fn enqueue_oneway(&mut self, oneway: OneWay) -> Result<(), Error>
+    pub fn enqueue_oneway(&self, oneway: OneWay) -> impl Future<Output=Result<(), Error>> + 'static
     {
-        let env = Envelope::<OneWay,Request,Response>::OneWay(oneway);
-        self.enqueue.unbounded_send(env).map_err(|_| Error::Queue)
+        let reception = self.reception.clone();
+        async move {
+            let env = Envelope::<OneWay,Request,Response>::OneWay(oneway);
+            let guard = reception.lock().await;
+            guard.enqueue.unbounded_send(env).map_err(|_| Error::Queue)
+        }
     }
 
     /// Enqueue a Request message for sending, and return a future that will be
     /// filled in when the response arrives.
-    pub fn enqueue_request(&mut self, req: Request) -> impl Future<Output=Result<Response, Error>> + 'static {
-        let curr = self.next_request;
-        self.next_request += 1;
-        let env = Envelope::<OneWay,Request,Response>::Request(curr, req);
-        let send_err =  self.enqueue.unbounded_send(env);
-        let (send, recv) = channel();
-        if send_err.is_ok() {
-            trace!("enqueued envelope for request {}", curr);
-            self.requests.insert(curr, send);
-        }
+    pub fn enqueue_request(&self, req: Request) -> impl Future<Output=Result<Response, Error>> + 'static {
+        let reception = self.reception.clone();
         async move {
+            let (send_err, recv) = {
+                let mut guard = reception.lock().await;
+                let curr = guard.next_request;
+                let env = Envelope::<OneWay,Request,Response>::Request(curr, req);
+                let send_err =  guard.enqueue.unbounded_send(env);
+                let (send, recv) = channel();
+                if send_err.is_ok() {
+                    trace!("enqueued envelope for request {}", curr);
+                    guard.next_request += 1;
+                    guard.requests.insert(curr, send);
+                }
+                // Now release the mutex guard and let the error and future exit
+                (send_err, recv)
+            };
             if send_err.is_ok() {
                 Ok(recv.await?)
             } else {
@@ -232,7 +248,7 @@ Connection<OneWay, Request, Response> {
                 Some((n, response)) => {
                     let env = Envelope::Response(n, response);
                     trace!("finished serving request {}, enqueueing response", n);
-                    self.enqueue.unbounded_send(env).map_err(|_| Error::Queue)
+                    self.reception.lock().await.enqueue.unbounded_send(env).map_err(|_| Error::Queue)
                 }
             },
             read_result = self.io.recv::<OneWay,Request,Response>().fuse() => {
@@ -240,7 +256,7 @@ Connection<OneWay, Request, Response> {
                 match env {
                     Envelope::OneWay(ow) => {
                         trace!("received one-way envelope, calling service function");
-                        Ok((srv_ow(ow)))
+                        Ok(srv_ow(ow))
                     },
                     Envelope::Request(n, req) => {
                         trace!("received request envelope {}, calling service function", n);
@@ -250,7 +266,7 @@ Connection<OneWay, Request, Response> {
                     },
                     Envelope::Response(n, res) => {
                         trace!("received response envelope {}, transferring to future", n);
-                        match self.requests.remove(&n.clone()) {
+                        match self.reception.lock().await.requests.remove(&n.clone()) {
                             None => Err(Error::UnknownResponse(n)),
                             Some(send) => {
                                 match send.send(res) {
