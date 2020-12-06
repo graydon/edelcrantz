@@ -67,7 +67,8 @@ fn req_res() {
     let mut peer_a = Connection::<OneWay, Request, Response>::new(a_end);
     let mut peer_b = Connection::<OneWay, Request, Response>::new(b_end);
 
-    let res_fut = peer_a.enqueue_request(Request("hello".into())).fuse();
+    let q = peer_a.queue.clone();
+    let res_fut = q.enqueue_request(Request("hello".into())).fuse();
     pin_mut!(res_fut);
     block_on(async move {
         loop {
