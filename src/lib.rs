@@ -87,14 +87,14 @@ pub enum Error {
 }
 
 struct IO {
-    rw: Mutex<Box<dyn AsyncReadWrite>>,
+    rw: Box<dyn AsyncReadWrite>,
     buf: Vec<u8>,
 }
 
 impl IO {
     fn new<RW:AsyncReadWrite>(rw:RW) -> Self {
         IO {
-            rw: Mutex::new(Box::new(rw)),
+            rw: Box::new(rw),
             buf: Vec::new(),
         }
     }
@@ -105,9 +105,8 @@ impl IO {
         let bytes = to_vec_packed(&e)?;
         let wsz: u64 = bytes.len() as u64;
         trace!("sending {}-byte envelope at IO level", wsz);
-        let mut guard = self.rw.lock().await;
-        guard.byte_order().write_u64::<LittleEndian>(wsz).await?;
-        guard.write_all(bytes.as_slice()).await?;
+        self.rw.byte_order().write_u64::<LittleEndian>(wsz).await?;
+        self.rw.write_all(bytes.as_slice()).await?;
         trace!("sent {}-byte envelope at IO level", wsz);
         Ok(())
     }
@@ -116,10 +115,9 @@ impl IO {
     async fn recv<OneWay:Msg, Request:Msg, Response:Msg>(&mut self) -> Result<Envelope<OneWay,Request,Response>, Error> {
         trace!("receiving envelope at IO level");
         use byteorder_async::{ReaderToByteOrder,LittleEndian};
-        let mut guard = self.rw.lock().await;
-        let rsz: u64 = guard.byte_order().read_u64::<LittleEndian>().await?;
+        let rsz: u64 = self.rw.byte_order().read_u64::<LittleEndian>().await?;
         self.buf.resize(rsz as usize, 0);
-        guard.read_exact(self.buf.as_mut_slice()).await?;
+        self.rw.read_exact(self.buf.as_mut_slice()).await?;
         trace!("received {}-byte envelope at IO level", rsz);
         Ok(from_slice(self.buf.as_slice())?)
     }
@@ -218,7 +216,7 @@ pub struct Connection<OneWay:Msg, Request:Msg, Response:Msg> {
     dequeue: UnboundedReceiver<Envelope<OneWay,Request,Response>>,
 
     /// Futures being fulfilled by requests being served by this peer.
-    responses: Mutex<FuturesUnordered<BoxFuture<'static, (u64, Response)>>>,
+    responses: FuturesUnordered<BoxFuture<'static, (u64, Response)>>,
 }
 
 #[serde(bound = "")]
@@ -243,7 +241,7 @@ Connection<OneWay, Request, Response> {
         let io = IO::new(rw);
         let next_request = 0;
         let requests = HashMap::new();
-        let responses = Mutex::new(FuturesUnordered::new());
+        let responses = FuturesUnordered::new();
         let (enqueue, dequeue) = unbounded();
         let queue = Queue::new(Reception{next_request, requests, enqueue});
         Connection { io, queue, responses, dequeue }
@@ -276,7 +274,6 @@ Connection<OneWay, Request, Response> {
           FutureResponse: Future<Output=Response> + Send + 'static,
           ServeOneWay: FnOnce(OneWay)->()
     {
-        let mut resp_guard = self.responses.lock().await;
         select_biased! {
             next_enqueued = self.dequeue.next() => match next_enqueued {
                 None => Ok(()),
@@ -285,7 +282,7 @@ Connection<OneWay, Request, Response> {
                     Ok(self.io.send(env).await?)
                 }
             },
-            next_response = resp_guard.next() => match next_response {
+            next_response = self.responses.next() => match next_response {
                 None => Ok(()),
                 Some((n, response)) => {
                     let env = Envelope::Response(n, response);
@@ -304,7 +301,7 @@ Connection<OneWay, Request, Response> {
                         trace!("received request envelope {}, calling service function", n);
                         let res_fut = srv_req(req);
                         let boxed : BoxFuture<'static,_> = Box::pin(res_fut.map(move |r| (n, r)));
-                        Ok(resp_guard.push(boxed))
+                        Ok(self.responses.push(boxed))
                     },
                     Envelope::Response(n, res) => {
                         trace!("received response envelope {}, transferring to future", n);
