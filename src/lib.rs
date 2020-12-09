@@ -47,7 +47,7 @@ use futures::io::{AsyncRead,AsyncWrite,AsyncReadExt,AsyncWriteExt};
 use futures::channel::oneshot::{channel,Sender};
 use futures::stream::{FuturesUnordered,StreamExt};
 use futures::lock::Mutex;
-use futures::{select_biased};
+use futures::{select};
 use futures::channel::mpsc::{unbounded,UnboundedReceiver,UnboundedSender};
 use thiserror::Error;
 use std::{sync::Arc, collections::{HashMap}};
@@ -61,7 +61,7 @@ pub trait AsyncReadWrite : AsyncRead + AsyncWrite + Send + Sync + Unpin + 'stati
 impl<T> AsyncReadWrite for T where T : AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static {}
 
 /// Any message that can be sent or received -- as a request, response, or
-/// one-way -- must implement this trait. 
+/// one-way -- must implement this trait.
 pub trait Msg : Serialize + DeserializeOwned + Send + Sync + 'static {}
 impl<T> Msg for T where T : Serialize + DeserializeOwned + Send + Sync + 'static {}
 
@@ -92,6 +92,7 @@ struct IO {
 }
 
 impl IO {
+
     fn new<RW:AsyncReadWrite>(rw:RW) -> Self {
         IO {
             rw: Box::new(rw),
@@ -110,7 +111,7 @@ impl IO {
         trace!("sent {}-byte envelope at IO level", wsz);
         Ok(())
     }
-    
+
     /// Receive a length-prefixed envelope.
     async fn recv<OneWay:Msg, Request:Msg, Response:Msg>(&mut self) -> Result<Envelope<OneWay,Request,Response>, Error> {
         trace!("receiving envelope at IO level");
@@ -274,7 +275,7 @@ Connection<OneWay, Request, Response> {
           FutureResponse: Future<Output=Response> + Send + 'static,
           ServeOneWay: FnOnce(OneWay)->()
     {
-        select_biased! {
+        select! {
             next_enqueued = self.dequeue.next() => match next_enqueued {
                 None => Ok(()),
                 Some(env) => {
@@ -314,7 +315,7 @@ Connection<OneWay, Request, Response> {
                                 }
                             }
                         }
-                    }    
+                    }
                 }
             }
         }
