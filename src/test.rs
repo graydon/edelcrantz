@@ -1,17 +1,17 @@
-use sluice::pipe::{pipe,PipeReader,PipeWriter};
+use async_std::task::block_on;
 use duplexify::Duplex;
-use async_std::task::{block_on};
-use serde::{Serialize,Deserialize};
-use futures::{pin_mut,select};
+use futures::{pin_mut, select};
 use log::trace;
+use serde::{Deserialize, Serialize};
+use sluice::pipe::{pipe, PipeReader, PipeWriter};
 
 use crate::*;
 
-#[derive(Serialize,Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Request(String);
-#[derive(Serialize,Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct Response(String);
-#[derive(Serialize,Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct OneWay(String);
 
 async fn serve_req(req: Request) -> Response {
@@ -34,14 +34,13 @@ fn duplex_pair() -> (PipeRw, PipeRw) {
 
 #[test]
 fn one_way() {
-
     let _ = pretty_env_logger::try_init();
 
     let (a_end, b_end) = duplex_pair();
     let mut peer_a = Connection::<OneWay, Request, Response>::new(a_end);
     let mut peer_b = Connection::<OneWay, Request, Response>::new(b_end);
 
-    block_on(async move {   
+    block_on(async move {
         peer_a.enqueue_oneway(OneWay("hello".into())).await.unwrap();
         loop {
             let mut done = false;
@@ -60,7 +59,6 @@ fn one_way() {
 
 #[test]
 fn req_res() {
-
     let _ = pretty_env_logger::try_init();
 
     let (a_end, b_end) = duplex_pair();
