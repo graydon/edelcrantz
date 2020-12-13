@@ -1,4 +1,4 @@
-use async_std::task::block_on;
+use async_std::task::{self, block_on};
 use duplexify::Duplex;
 use futures::{pin_mut, select};
 use log::trace;
@@ -76,6 +76,60 @@ fn req_res() {
                 r = res_fut => {
                     let Response(b) = r.unwrap();
                     trace!("got response: {:?}", b);
+                    break;
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn december_deadlock() {
+    // This test reproduced a deadlock we found in version 0.4.3 and before,
+    // when two copies of edelcrantz were talking to one another: if the buffer
+    // space between them was inadequate it could be the case that each would
+    // await the other finishing a write in order to switch to reading.
+    //
+    // As of 0.5 we've redesigned the guts a bit and this is no longer possible;
+    // the select loop sees pending IO-level reads and writes simultaneously.
+    let _ = pretty_env_logger::try_init();
+    let (a_end, b_end) = duplex_pair();
+    let mut peer_a = Connection::<OneWay, Request, Response>::new(a_end);
+    let mut peer_b = Connection::<OneWay, Request, Response>::new(b_end);
+
+    let q = peer_a.queue.clone();
+    let (send, recv) = channel();
+
+    task::spawn(async move {
+        let mut fu = FuturesUnordered::new();
+        for i in 1..100 {
+            fu.push(q.enqueue_request(Request(format!("hello {}", i).into())));
+        }
+        loop {
+            select! {
+                res = fu.next() => match res {
+                    Some(res) => {
+                        let Response(b) = res.unwrap();
+                        trace!("got response: {:?}", b);
+                    }
+                    None => {
+                        break;
+                    }
+                },
+                r = peer_a.advance(serve_req, serve_oneway).fuse() => r.unwrap()
+            }
+        }
+        trace!("sending shutdown signal");
+        send.send(()).unwrap();
+    });
+
+    block_on(async move {
+        let mut recv = recv.fuse();
+        loop {
+            select! {
+                _ = peer_b.advance(serve_req, serve_oneway).fuse() => (),
+                _ = recv => {
+                    trace!("got shutdown signal");
                     break;
                 }
             }

@@ -49,7 +49,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use futures::{self, Future};
 use futures::{
     future,
-    future::{BoxFuture, FutureExt, TryFutureExt},
+    future::{BoxFuture, FutureExt},
 };
 use log::trace;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -222,7 +222,7 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Queue<OneWay, Request, Response> 
             if send_err.is_ok() {
                 Ok(recv.await?)
             } else {
-                Err(futures::future::ready(Error::Queue).await)
+                Err(Error::Queue)
             }
         }
     }
@@ -250,11 +250,11 @@ pub struct Connection<OneWay: Msg, Request: Msg, Response: Msg> {
 
     /// A selectable future for a current IO read-in-progress on reader.
     /// If this is Some(x) then reader is locked.
-    read_in_progress: Option<PendingRead<OneWay, Request, Response>>,
+    reads_in_progress: FuturesUnordered<PendingRead<OneWay, Request, Response>>,
 
     /// A selectable future for a current IO write-in-progress on writer.
     /// If this is Some(x) then writer is locked.
-    write_in_progress: Option<PendingWrite>,
+    writes_in_progress: FuturesUnordered<PendingWrite>,
 
     /// A queue that can be cloned out of the Connection and used to submit
     /// work without having exclusive ownership of the Connection.
@@ -283,8 +283,14 @@ enum Envelope<OneWay: Msg, Request: Msg, Response: Msg> {
 /// by messages of the response type, and messages of the one-way type will not
 /// be responded to.
 impl<OneWay: Msg, Request: Msg, Response: Msg> Connection<OneWay, Request, Response> {
-    pub fn new<RW: AsyncReadWrite>(rw: RW) -> Self {
-        let (rdr, wtr) = rw.split();
+    /// Construct a new Connection from a separate AsyncRead and AsyncWrite pair;
+    /// in some cases this will perform better than passing a merged AsyncRead+AsyncWrite
+    /// and having it split (which we do in `new` below).
+    pub fn new_split<R, W>(rdr: R, wtr: W) -> Self
+    where
+        R: AsyncRead + Unpin + Send + Sync + 'static,
+        W: AsyncWrite + Unpin + Send + Sync + 'static,
+    {
         let reader = Arc::new(Mutex::new(EnvelopeReader::new(rdr)));
         let writer = Arc::new(Mutex::new(EnvelopeWriter::new(wtr)));
         let next_request = 0;
@@ -297,17 +303,24 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Connection<OneWay, Request, Respo
             enqueue,
         });
 
-        let read_in_progress = None;
-        let write_in_progress = None;
+        let reads_in_progress = FuturesUnordered::new();
+        let writes_in_progress = FuturesUnordered::new();
         Connection {
             reader,
             writer,
             queue,
-            read_in_progress,
-            write_in_progress,
+            reads_in_progress,
+            writes_in_progress,
             responses,
             dequeue,
         }
+    }
+
+    /// Construct a new Connection from an AsyncRead+AsyncWrite value, splitting
+    /// it and passing the read and write parts to `new_split`.
+    pub fn new<RW: AsyncReadWrite>(rw: RW) -> Self {
+        let (rdr, wtr) = rw.split();
+        Self::new_split(rdr, wtr)
     }
 
     /// Just calls `self.queue.enqueue_oneway`.
@@ -324,6 +337,20 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Connection<OneWay, Request, Respo
         req: Request,
     ) -> impl Future<Output = Result<Response, Error>> + 'static {
         self.queue.enqueue_request(req)
+    }
+
+    fn issue_read(&mut self) {
+        let rdr = self.reader.clone();
+        let fut = Box::pin(
+            async move { rdr.lock().await.recv::<OneWay, Request, Response>().await }.fuse(),
+        );
+        self.reads_in_progress.push(fut);
+    }
+
+    fn issue_write(&mut self, env: Envelope<OneWay, Request, Response>) {
+        let wtr = self.writer.clone();
+        let fut = Box::pin(async move { wtr.lock().await.send(env).await }.fuse());
+        self.writes_in_progress.push(fut);
     }
 
     /// Take the next available step on this connection. Either:
@@ -347,75 +374,59 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Connection<OneWay, Request, Respo
         FutureResponse: Future<Output = Response> + Send + 'static,
         ServeOneWay: FnOnce(OneWay) -> (),
     {
-        let rdr = self.reader.clone();
-        let wtr = self.writer.clone();
-        let mut rip = self.read_in_progress.take().unwrap_or_else(|| {
-            Box::pin(
-                async move { rdr.lock().await.recv::<OneWay, Request, Response>().await }.fuse(),
-            )
-        });
-        let mut wip = self
-            .write_in_progress
-            .take()
-            .unwrap_or_else(|| Box::pin(future::pending()));
+        if self.reads_in_progress.len() == 0 {
+            self.issue_read();
+        }
         select! {
-            res = wip => {
-                // Put back rip
-                self.read_in_progress = Some(rip);
-                res
+            next_written = self.writes_in_progress.next() => match next_written {
+                None => (Ok(())),
+                Some(res) => res
             },
             next_enqueued = self.dequeue.next() => match next_enqueued {
-                None => {
-                    // Put back rip and wip
-                    self.read_in_progress = Some(rip);
-                    self.write_in_progress = Some(wip);
-                    Ok(())
-                }
+                None => Ok(()),
                 Some(env) => {
-                    // Put back rip
-                    self.read_in_progress = Some(rip);
                     trace!("dequeued envelope, sending");
-                    let write_fut = Box::pin(async move { wtr.lock().await.send(env).await }.fuse().and_then(move |_| wip));
-                    self.write_in_progress = Some(write_fut);
+                    self.issue_write(env);
                     Ok(())
                 }
             },
             next_response = self.responses.next() => {
-                // Put back rip and wip
-                self.read_in_progress = Some(rip);
-                self.write_in_progress = Some(wip);
                 match next_response {
                     None => Ok(()),
                     Some((n, response)) => {
                         let env = Envelope::Response(n, response);
                         trace!("finished serving request {}, enqueueing response", n);
-                        self.queue.reception.lock().await.enqueue.unbounded_send(env).map_err(|_| Error::Queue)
+                        let guard = self.queue.reception.lock().await;
+                        guard.enqueue.unbounded_send(env).map_err(|_| Error::Queue)
                     }
                 }
             },
-            read_result = rip => {
-                // Put back wip
-                self.write_in_progress = Some(wip);
-                let env = read_result?;
-                match env {
-                    Envelope::OneWay(ow) => {
-                        trace!("received one-way envelope, calling service function");
-                        Ok(srv_ow(ow))
-                    },
-                    Envelope::Request(n, req) => {
-                        trace!("received request envelope {}, calling service function", n);
-                        let res_fut = srv_req(req);
-                        let boxed : BoxFuture<'static,_> = Box::pin(res_fut.map(move |r| (n, r)));
-                        Ok(self.responses.push(boxed))
-                    },
-                    Envelope::Response(n, res) => {
-                        trace!("received response envelope {}, transferring to future", n);
-                        match self.queue.reception.lock().await.requests.remove(&n.clone()) {
-                            None => Err(Error::UnknownResponse(n)),
-                            Some(send) => {
-                                match send.send(res) {
-                                    Ok(_) => Ok(()),
-                                    Err(_) => Err(Error::ResponseChannelDropped(n))
+            next_read = self.reads_in_progress.next() => match next_read {
+                None => Ok(()),
+                Some(read_result) => {
+                    self.issue_read();
+                    let env = read_result?;
+                    match env {
+                        Envelope::OneWay(ow) => {
+                            trace!("received one-way envelope, calling service function");
+                            Ok(srv_ow(ow))
+                        },
+                        Envelope::Request(n, req) => {
+                            trace!("received request envelope {}, calling service function", n);
+                            let res_fut = srv_req(req);
+                            let boxed : BoxFuture<'static,_> = Box::pin(res_fut.map(move |r| (n, r)));
+                            Ok(self.responses.push(boxed))
+                        },
+                        Envelope::Response(n, res) => {
+                            trace!("received response envelope {}, fulfilling future", n);
+                            let mut guard = self.queue.reception.lock().await;
+                            match guard.requests.remove(&n.clone()) {
+                                None => Err(Error::UnknownResponse(n)),
+                                Some(send) => {
+                                    match send.send(res) {
+                                        Ok(_) => Ok(()),
+                                        Err(_) => Err(Error::ResponseChannelDropped(n))
+                                    }
                                 }
                             }
                         }
