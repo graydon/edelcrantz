@@ -1,7 +1,7 @@
 [package]
 name = "edelcrantz"
 description = "async peer-to-peer rpc-and-messaging service"
-version = "0.5.1-alpha.0"
+version = "0.6.0"
 authors = ["Graydon Hoare <graydon@pobox.com>"]
 edition = "2018"
 license = "MIT OR Apache-2.0"
