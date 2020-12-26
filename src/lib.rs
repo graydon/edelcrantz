@@ -36,8 +36,6 @@
 //! telegraph system](https://en.wikipedia.org/wiki/Optical_telegraph#Sweden),
 //! which operated from 1795-1881.
 
-// TODO: write tests that do multiple rounds of req/res and bi-directional req/res.
-
 #![recursion_limit = "512"]
 use future::FusedFuture;
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
@@ -51,11 +49,11 @@ use futures::{
     future,
     future::{BoxFuture, FutureExt},
 };
-use log::trace;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_cbor::{de::from_slice, ser::to_vec_packed};
+use std::fmt::Debug;
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 use thiserror::Error;
+use tracing::{instrument, trace, trace_span, Instrument};
 
 #[cfg(test)]
 mod test;
@@ -84,7 +82,7 @@ pub enum Error {
     Io(#[from] futures::io::Error),
 
     #[error(transparent)]
-    Cbor(#[from] serde_cbor::Error),
+    Postcard(#[from] postcard::Error),
 
     #[error(transparent)]
     Canceled(#[from] futures::channel::oneshot::Canceled),
@@ -100,17 +98,16 @@ impl EnvelopeWriter {
     }
 
     /// Send a length-prefixed envelope.
+    #[instrument(skip(self, e))]
     async fn send<OneWay: Msg, Request: Msg, Response: Msg>(
         &mut self,
         e: Envelope<OneWay, Request, Response>,
     ) -> Result<(), Error> {
         use byteorder_async::{LittleEndian, WriterToByteOrder};
-        let bytes = to_vec_packed(&e)?;
+        let bytes = postcard::to_allocvec(&e)?;
         let wsz: u64 = bytes.len() as u64;
-        trace!("sending {}-byte envelope at IO level", wsz);
         self.wr.byte_order().write_u64::<LittleEndian>(wsz).await?;
         self.wr.write_all(bytes.as_slice()).await?;
-        trace!("sent {}-byte envelope at IO level", wsz);
         Ok(())
     }
 }
@@ -129,16 +126,15 @@ impl EnvelopeReader {
     }
 
     /// Receive a length-prefixed envelope.
+    #[instrument(skip(self))]
     async fn recv<OneWay: Msg, Request: Msg, Response: Msg>(
         &mut self,
     ) -> Result<Envelope<OneWay, Request, Response>, Error> {
-        trace!("receiving envelope at IO level");
         use byteorder_async::{LittleEndian, ReaderToByteOrder};
         let rsz: u64 = self.rd.byte_order().read_u64::<LittleEndian>().await?;
         self.rdbuf.resize(rsz as usize, 0);
         self.rd.read_exact(self.rdbuf.as_mut_slice()).await?;
-        trace!("received {}-byte envelope at IO level", rsz);
-        Ok(from_slice(self.rdbuf.as_slice())?)
+        Ok(postcard::from_bytes(self.rdbuf.as_slice())?)
     }
 }
 
@@ -190,11 +186,13 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Queue<OneWay, Request, Response> 
         oneway: OneWay,
     ) -> impl Future<Output = Result<(), Error>> + 'static {
         let reception = self.reception.clone();
-        async move {
+        let span = tracing::trace_span!("enqueue_oneway");
+        (async move {
             let env = Envelope::<OneWay, Request, Response>::OneWay(oneway);
             let guard = reception.lock().await;
             guard.enqueue.unbounded_send(env).map_err(|_| Error::Queue)
-        }
+        })
+        .instrument(span)
     }
 
     /// Enqueue a Request message for sending, and return a future that will be
@@ -204,7 +202,8 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Queue<OneWay, Request, Response> 
         req: Request,
     ) -> impl Future<Output = Result<Response, Error>> + 'static {
         let reception = self.reception.clone();
-        async move {
+        let span = trace_span!("enqueue_request");
+        (async move {
             let (send_err, recv) = {
                 let mut guard = reception.lock().await;
                 let curr = guard.next_request;
@@ -212,7 +211,7 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Queue<OneWay, Request, Response> 
                 let send_err = guard.enqueue.unbounded_send(env);
                 let (send, recv) = channel();
                 if send_err.is_ok() {
-                    trace!("enqueued envelope for request {}", curr);
+                    tracing::trace!(?curr, "enqueued envelope for request");
                     guard.next_request += 1;
                     guard.requests.insert(curr, send);
                 }
@@ -224,7 +223,8 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Queue<OneWay, Request, Response> 
             } else {
                 Err(Error::Queue)
             }
-        }
+        })
+        .instrument(span)
     }
 }
 
@@ -265,10 +265,13 @@ pub struct Connection<OneWay: Msg, Request: Msg, Response: Msg> {
 
     /// Futures being fulfilled by requests being served by this peer.
     responses: FuturesUnordered<BoxFuture<'static, (u64, Response)>>,
+
+    /// Tracing support: counts each envelope received, sequentially.
+    envelope_count: usize,
 }
 
 #[serde(bound = "")]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 enum Envelope<OneWay: Msg, Request: Msg, Response: Msg> {
     OneWay(OneWay),
     Request(u64, Request),
@@ -313,6 +316,7 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Connection<OneWay, Request, Respo
             writes_in_progress,
             responses,
             dequeue,
+            envelope_count: 0,
         }
     }
 
@@ -364,6 +368,7 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Connection<OneWay, Request, Respo
     /// Callers should supply a `srv_req` function to service request envelopes
     /// by issuing futures, and a `srv_ow` function to service one-way
     /// envelopes.
+    #[instrument(skip(self, srv_req, srv_ow))]
     pub async fn advance<ServeRequest, FutureResponse, ServeOneWay>(
         &mut self,
         srv_req: ServeRequest,
@@ -394,8 +399,8 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Connection<OneWay, Request, Respo
                 match next_response {
                     None => Ok(()),
                     Some((n, response)) => {
+                        trace!(n, "finished serving request, enqueueing response");
                         let env = Envelope::Response(n, response);
-                        trace!("finished serving request {}, enqueueing response", n);
                         let guard = self.queue.reception.lock().await;
                         guard.enqueue.unbounded_send(env).map_err(|_| Error::Queue)
                     }
@@ -404,21 +409,24 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Connection<OneWay, Request, Respo
             next_read = self.reads_in_progress.next() => match next_read {
                 None => Ok(()),
                 Some(read_result) => {
+                    self.envelope_count += 1;
                     self.issue_read();
                     let env = read_result?;
                     match env {
                         Envelope::OneWay(ow) => {
-                            trace!("received one-way envelope, calling service function");
-                            Ok(srv_ow(ow))
+                            trace!("received one-way, calling service function");
+                            let span = trace_span!("oneway", e=self.envelope_count);
+                            Ok(span.in_scope(|| srv_ow(ow)))
                         },
                         Envelope::Request(n, req) => {
-                            trace!("received request envelope {}, calling service function", n);
+                            trace!(n, "received request, calling service function");
+                            let span = trace_span!("req", e=self.envelope_count);
                             let res_fut = srv_req(req);
-                            let boxed : BoxFuture<'static,_> = Box::pin(res_fut.map(move |r| (n, r)));
+                            let boxed : BoxFuture<'static,_> = Box::pin(res_fut.instrument(span).map(move |r| (n, r)));
                             Ok(self.responses.push(boxed))
                         },
                         Envelope::Response(n, res) => {
-                            trace!("received response envelope {}, fulfilling future", n);
+                            trace!(n, "received response, fulfilling future");
                             let mut guard = self.queue.reception.lock().await;
                             match guard.requests.remove(&n.clone()) {
                                 None => Err(Error::UnknownResponse(n)),

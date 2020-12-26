@@ -10,15 +10,16 @@ repository = "http://github.com/graydon/edelcrantz"
 readme = "README.md"
 
 [dependencies]
-log = "0.4.11"
 serde = { version = "1.0", features = ["derive"] }
-serde_cbor = "0.11.1"
+postcard = {version="0.5.1", features = ["alloc"]}
 byteorder_async = {version="1.2.0", features=["futures_async"] }
 futures = "0.3.5"
 thiserror = "1.0"
+tracing = "0.1.22"
+tracing-futures = "0.2.4"
 
 [dev-dependencies]
 sluice = "0.5.2"
 duplexify = "1.2.2"
 async-std = "1.7.0"
-pretty_env_logger = "0.4"
+tracing-subscriber = {version="0.2.15", features = ["chrono", "env-filter", "fmt"]}

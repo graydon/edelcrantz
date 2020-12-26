@@ -1,17 +1,18 @@
 use async_std::task::{self, block_on};
 use duplexify::Duplex;
 use futures::{pin_mut, select};
-use log::trace;
 use serde::{Deserialize, Serialize};
 use sluice::pipe::{pipe, PipeReader, PipeWriter};
+use tracing::trace;
+use tracing_subscriber;
 
 use crate::*;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Request(String);
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Response(String);
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct OneWay(String);
 
 async fn serve_req(req: Request) -> Response {
@@ -32,10 +33,13 @@ fn duplex_pair() -> (PipeRw, PipeRw) {
     (a_end, b_end)
 }
 
+fn setup_tracing() {
+    let _ = tracing_subscriber::fmt::try_init();
+}
+
 #[test]
 fn one_way() {
-    let _ = pretty_env_logger::try_init();
-
+    setup_tracing();
     let (a_end, b_end) = duplex_pair();
     let mut peer_a = Connection::<OneWay, Request, Response>::new(a_end);
     let mut peer_b = Connection::<OneWay, Request, Response>::new(b_end);
@@ -59,8 +63,7 @@ fn one_way() {
 
 #[test]
 fn req_res() {
-    let _ = pretty_env_logger::try_init();
-
+    setup_tracing();
     let (a_end, b_end) = duplex_pair();
     let mut peer_a = Connection::<OneWay, Request, Response>::new(a_end);
     let mut peer_b = Connection::<OneWay, Request, Response>::new(b_end);
@@ -92,7 +95,7 @@ fn december_deadlock() {
     //
     // As of 0.5 we've redesigned the guts a bit and this is no longer possible;
     // the select loop sees pending IO-level reads and writes simultaneously.
-    let _ = pretty_env_logger::try_init();
+    setup_tracing();
     let (a_end, b_end) = duplex_pair();
     let mut peer_a = Connection::<OneWay, Request, Response>::new(a_end);
     let mut peer_b = Connection::<OneWay, Request, Response>::new(b_end);
