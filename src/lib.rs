@@ -53,7 +53,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fmt::Debug;
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 use thiserror::Error;
-use tracing::{instrument, trace, trace_span, Instrument};
+use tracing::{instrument, trace, debug_span, Instrument};
 
 #[cfg(test)]
 mod test;
@@ -186,13 +186,11 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Queue<OneWay, Request, Response> 
         oneway: OneWay,
     ) -> impl Future<Output = Result<(), Error>> + 'static {
         let reception = self.reception.clone();
-        let span = tracing::trace_span!("enqueue_oneway");
-        (async move {
+        async move {
             let env = Envelope::<OneWay, Request, Response>::OneWay(oneway);
             let guard = reception.lock().await;
             guard.enqueue.unbounded_send(env).map_err(|_| Error::Queue)
-        })
-        .instrument(span)
+        }
     }
 
     /// Enqueue a Request message for sending, and return a future that will be
@@ -202,8 +200,7 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Queue<OneWay, Request, Response> 
         req: Request,
     ) -> impl Future<Output = Result<Response, Error>> + 'static {
         let reception = self.reception.clone();
-        let span = trace_span!("enqueue_request");
-        (async move {
+        async move {
             let (send_err, recv) = {
                 let mut guard = reception.lock().await;
                 let curr = guard.next_request;
@@ -223,8 +220,7 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Queue<OneWay, Request, Response> 
             } else {
                 Err(Error::Queue)
             }
-        })
-        .instrument(span)
+        }
     }
 }
 
@@ -368,7 +364,6 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Connection<OneWay, Request, Respo
     /// Callers should supply a `srv_req` function to service request envelopes
     /// by issuing futures, and a `srv_ow` function to service one-way
     /// envelopes.
-    #[instrument(skip(self, srv_req, srv_ow))]
     pub async fn advance<ServeRequest, FutureResponse, ServeOneWay>(
         &mut self,
         srv_req: ServeRequest,
@@ -415,12 +410,12 @@ impl<OneWay: Msg, Request: Msg, Response: Msg> Connection<OneWay, Request, Respo
                     match env {
                         Envelope::OneWay(ow) => {
                             trace!("received one-way, calling service function");
-                            let span = trace_span!("oneway", e=self.envelope_count);
+                            let span = debug_span!("RPC", e=self.envelope_count);
                             Ok(span.in_scope(|| srv_ow(ow)))
                         },
                         Envelope::Request(n, req) => {
                             trace!(n, "received request, calling service function");
-                            let span = trace_span!("req", e=self.envelope_count);
+                            let span = debug_span!("RPC", e=self.envelope_count);
                             let res_fut = srv_req(req);
                             let boxed : BoxFuture<'static,_> = Box::pin(res_fut.instrument(span).map(move |r| (n, r)));
                             Ok(self.responses.push(boxed))
